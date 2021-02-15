@@ -47,7 +47,7 @@ prop_map_zipWith :: Property
 prop_map_zipWith = property propertyLambda 
 -- forall f xs ys. map (uncurry f) (zip xs ys) = zipWith f xs ys
 
---ghciQuickCheck :: [FilePath] -> String -> IO [(String,String)]
+ghciQuickCheck :: [FilePath] -> String -> IO ()
 ghciQuickCheck modules adhocInput = do 
     (g, _) <- startGhci "ghci" (Just ".") (const $ const $ return ())
     let executeStatement = exec g
