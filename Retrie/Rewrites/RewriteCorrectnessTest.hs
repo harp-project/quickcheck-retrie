@@ -1,10 +1,10 @@
--- Copyright (c) Facebook, Inc. and its affiliates.
+-- Copyright (c) ELTE.
 --
 -- This source code is licensed under the MIT license found in the
 -- LICENSE file in the root directory of this source tree.
 --
 
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, LambdaCase #-}
 
 module Retrie.Rewrites.RewriteCorrectnessTest where
 
@@ -12,6 +12,7 @@ import Test.QuickCheck
 import Test.QuickCheck.Function
 import Test.QuickCheck.Poly
 import Data.Char
+import Control.Monad
 import Data.List
 import System.IO
 import Language.Haskell.Ghcid
@@ -47,25 +48,34 @@ prop_map_zipWith :: Property
 prop_map_zipWith = property propertyLambda 
 -- forall f xs ys. map (uncurry f) (zip xs ys) = zipWith f xs ys
 
-ghciQuickCheck :: [FilePath] -> String -> IO ()
-ghciQuickCheck modules adhocInput = do 
+isRewritingAllowed :: [FilePath] -> String -> IO Bool
+isRewritingAllowed modules adhocInput = do 
     (g, _) <- startGhci "ghci" (Just ".") (const $ const $ return ())
     let executeStatement = exec g
     executeStatement $ unwords $ ":l" : modules
     executeStatement "import Test.QuickCheck"
     res <- unwords . words . concat <$> executeStatement (":t " ++ lambda)
-    let [_,r] = splitOn ":: " res
-    let withoutContext = last $ splitOn "=> " r
-    let (Right t) = parseType withoutContext
-    let varsWithTypes = zip variables $ map (map pp . argumentsOfType . typeVarToInteger) $ argumentsOfType t
-    let varExps = map (\(a,b) -> let (Right e) = parseExp a in (e, length b - 1)) $ filter (\(_,b) -> length b >= 3) varsWithTypes
-    let (Right lhs, Right rhs) = (parseExp lhs', parseExp rhs')
-    let (newLhs, newRhs) = foldr (\(exp,n) (l,r) -> (toCurriedExp n exp l, toCurriedExp n exp r)) (lhs,rhs) varExps 
-    let newLambdaBody = '(': pp newLhs ++ ") === (" ++ pp newRhs ++ ")"
-    executeStatement $ defineTestFunction varsWithTypes newLambdaBody
-    testRes <- executeStatement "test"
-    print testRes
-    stopGhci g
+    let errorHandling x
+          | [_,r] <- x
+          , let withoutContext = last $ splitOn "=> " r
+          , Right t <- parseType withoutContext
+          , let varsWithTypes = zip variables $ map (map pp . argumentsOfType . typeVarToInteger) $ argumentsOfType t
+          , let length3 = [(parseExp a, length b) | (a, b@(_:_:_:_)) <- varsWithTypes]
+          , all (\case ((Right _), _) -> True; _ -> False) length3
+          , let varExps = map (\(Right e,b) -> (e, b)) length3
+          , (Right lhs, Right rhs) <- (parseExp lhs', parseExp rhs')
+          , let (newLhs, newRhs) = foldr (\(exp,n) (l,r) -> (toCurriedExp n exp l, toCurriedExp n exp r)) (lhs,rhs) varExps 
+          , let newLambdaBody = '(': pp newLhs ++ ") === (" ++ pp newRhs ++ ")" = do
+              executeStatement $ defineTestFunction varsWithTypes newLambdaBody
+              testRes <- executeStatement "test"
+              print testRes
+              let retVal = case testRes of
+                            ['+':'+':'+':' ':'O':'K':_] -> True
+                            _ -> False
+              stopGhci g
+              return retVal
+          | otherwise = return False
+    errorHandling $ splitOn ":: " res
     where      
       typeVarToInteger :: Type -> Type
       typeVarToInteger (VarT _) = ConT (Name (OccName "Integer") NameS)
