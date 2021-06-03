@@ -1,10 +1,9 @@
 -- Copyright (c) ELTE.
 --
--- This source code is licensed under the MIT license found in the
--- LICENSE file in the root directory of this source tree.
+-- This source code is licensed under the MIT license.
 --
 
-{-# LANGUAGE OverloadedStrings, LambdaCase #-}
+{-# LANGUAGE OverloadedStrings, LambdaCase, TypeApplications #-}
 
 module Retrie.Rewrites.RewriteCorrectnessTest where
 
@@ -13,6 +12,7 @@ import Test.QuickCheck.Function
 import Test.QuickCheck.Poly
 import Data.Char
 import Control.Monad
+import Control.Exception
 import Data.List
 import System.IO
 import Language.Haskell.Ghcid
@@ -48,35 +48,49 @@ prop_map_zipWith :: Property
 prop_map_zipWith = property propertyLambda 
 -- forall f xs ys. map (uncurry f) (zip xs ys) = zipWith f xs ys
 
-isRewritingAllowed :: [FilePath] -> String -> IO Bool
-isRewritingAllowed modules adhocInput = do 
-    (g, _) <- startGhci "ghci" (Just ".") (const $ const $ return ())
-    let executeStatement = exec g
-    executeStatement $ unwords $ ":l" : modules
-    executeStatement "import Test.QuickCheck"
-    res <- unwords . words . concat <$> executeStatement (":t " ++ lambda)
-    let errorHandling x
-          | [_,r] <- x
-          , let withoutContext = last $ splitOn "=> " r
-          , Right t <- parseType withoutContext
-          , let varsWithTypes = zip variables $ map (map pp . argumentsOfType . typeVarToInteger) $ argumentsOfType t
-          , let length3 = [(parseExp a, length b) | (a, b@(_:_:_:_)) <- varsWithTypes]
-          , all (\case ((Right _), _) -> True; _ -> False) length3
-          , let varExps = map (\(Right e,b) -> (e, b)) length3
-          , (Right lhs, Right rhs) <- (parseExp lhs', parseExp rhs')
-          , let (newLhs, newRhs) = foldr (\(exp,n) (l,r) -> (toCurriedExp n exp l, toCurriedExp n exp r)) (lhs,rhs) varExps 
-          , let newLambdaBody = '(': pp newLhs ++ ") === (" ++ pp newRhs ++ ")" = do
-              executeStatement $ defineTestFunction varsWithTypes newLambdaBody
-              testRes <- executeStatement "test"
-              print testRes
-              let retVal = case testRes of
-                            ['+':'+':'+':' ':'O':'K':_] -> True
-                            _ -> False
-              stopGhci g
-              return retVal
-          | otherwise = return False
-    errorHandling $ splitOn ":: " res
-    where      
+isRewritingAllowed :: String -> IO Bool
+isRewritingAllowed adhocInput = do
+    tryRunGhci <- (Right <$> startGhci "stack ghci --package QuickCheck" (Just ".") (const putStrLn))
+      `catch` \e1 -> (Right <$> const (startGhci "cabal v2-repl --build-depends \"QuickCheck >= 2.14\"" (Just ".") (const putStrLn)) (e1 :: SomeException))
+      `catch` \e -> (Right <$> const (startGhci "ghci" (Just ".") (const $ const $ return ())) (e :: SomeException))
+      `catch` \e2 -> (Left <$> const (putStrLn "ERROR: Couldn't find either stack nor cabal nor ghci. Correctness checker cannot run.") (e2 :: SomeException))
+    case tryRunGhci of
+        Right (g,_) -> do
+          let executeStatement = exec g
+          importList <- filter (not . null) . map (head . splitOn " ") . splitOn ")" . concat <$> executeStatement ":show modules"
+          executeStatement $ ":m + " ++ unwords (map ('*':) importList)
+          executeStatement "import Test.QuickCheck"
+          res <- unwords . words . concat <$> executeStatement (":t " ++ lambda)
+          putStrLn res
+          case splitOn ":: " res of
+            [_,r] -> case parseType $ last $ splitOn "=>" r of
+              Right t -> do 
+                let varsWithTypes = zip variables $ map (map pp . argumentsOfType . typeVarToInteger) $ argumentsOfType t
+                let length3 = [(parseExp a, length b) | (a, b@(_:_:_:_)) <- varsWithTypes]
+                case all (\case ((Right _), _) -> True; _ -> False) length3 of
+                  True -> do
+                    let varExps = map (\(Right x,y) -> (x, y)) length3
+                    case (parseExp lhs', parseExp rhs') of
+                      (Right lhs, Right rhs) -> do
+                        let (newLhs, newRhs) = foldr (\(exp,n) (l,r) -> (toCurriedExp n exp l, toCurriedExp n exp r)) (lhs,rhs) varExps
+                        let newLambdaBody = '(' : filter (/= '\n') (pp newLhs) ++ ") === (" ++ filter (/= '\n') (pp newRhs) ++ ")"
+                        lambdaRes <- executeStatement $ defineTestFunction varsWithTypes newLambdaBody
+                        putStrLn "!!! LAMBDA !!!"
+                        putStrLn $ unlines lambdaRes
+                        testRes <- executeStatement "test"
+                        (retText,retVal) <- return (case testRes of ['+':'+':'+':' ':'O':'K':_] -> ("Tests ran successfully.", True); x -> (unlines ("ERROR:" : x), False))
+                        stopGhci g
+                        putStrLn retText
+                        return retVal
+                      
+                      (Right _, Left t)  -> stopGhci g >> putStrLn t >> putStrLn "ERROR: Couldn't parse the right-hand-side expression!" >> return False
+                      (Left t, Right _)  -> stopGhci g >> putStrLn t >> putStrLn "ERROR: Couldn't parse the left-hand-side expression!" >> return False
+                      (Left t1, Left t2) -> stopGhci g >> putStrLn t1 >> putStrLn ('\n':t2) >> putStrLn "\nERROR: Couldn't parse the either side of the expression!" >> return False
+                  False -> stopGhci g >> putStrLn "ERROR: Couldn't parse all types!" >> return False
+              Left t -> stopGhci g >> putStrLn t >> putStrLn "ERROR: Couldn't parse the type of input!" >> return False
+            _ -> stopGhci g >> putStrLn "ERROR: Incorrect input format!" >> return False
+        _ -> return False
+    where
       typeVarToInteger :: Type -> Type
       typeVarToInteger (VarT _) = ConT (Name (OccName "Integer") NameS)
       typeVarToInteger (ForallT l cxt t) = ForallT l cxt (typeVarToInteger t)
@@ -145,7 +159,7 @@ isRewritingAllowed modules adhocInput = do
         else ([],adhocInput)
       (lhs', rhs') = (\(a,b) -> ('(' : a ++ ")", '(' : dropWhile isSpace (drop 1 b) ++ ")")) $ break (== '=') refactorRule
       variables = drop 1 $ words forallPart
-      lambdaBody = lhs' ++ "=== " ++ rhs'
+      lambdaBody = lhs' ++ " === " ++ rhs'
       lambda = case variables of 
         [] -> lambdaBody
         _  -> '\\' : unwords variables ++ " -> " ++ lambdaBody
